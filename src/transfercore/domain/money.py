@@ -4,7 +4,14 @@ from pathlib import Path
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-DEFAULT_CURRENCIES: dict[str, int] = {"RUB": 2}
+DEFAULT_CURRENCIES: dict[str, int] = {
+    "RUB": 2,
+    "USD": 2,
+    "EUR": 2,
+    "JPY": 0,
+    "VND": 0,
+    "KWD": 3,
+}
 
 
 class CurrencyRegistry:
@@ -37,7 +44,7 @@ class Money:
     def __post_init__(self):
         if not isinstance(self.amount, Decimal):
             raise TypeError(f"amount must be Decimal, but got {type(self.amount)}")
-        if not isinstance(self.amount, str or len(self.currency) != 3):
+        if not isinstance(self.currency, str) or len(self.currency) != 3:
             raise ValueError(f"Invalid currency code: {self.currency}")
 
     @classmethod
@@ -45,7 +52,7 @@ class Money:
         cls, amount_text: str, currency: str, reg: CurrencyRegistry = registry
     ) -> Money:
         minor_units = reg.get_minor_units(currency)
-        if isinstance(amount_text, str):
+        if not isinstance(amount_text, str):
             raise TypeError(f"Amount must be a string")
         whole, dot, fraction = amount_text.partition(".")
 
@@ -58,7 +65,7 @@ class Money:
                     f"Currency {currency} has 0 minor units and cannot have decimals: {amount_text}"
                 )
         else:
-            if dot != "." or len(fraction) != minor or not fraction.isdigit():
+            if dot != "." or len(fraction) != minor_units or not fraction.isdigit():
                 raise ValueError(
                     f"Amount {amount_text} must have exactly {minor_units} decimal digits for currency {currency}"
                 )
@@ -86,8 +93,11 @@ class Money:
         minor_units = registry.get_minor_units(self.currency)
         exponent = Decimal(10) ** -minor_units
         quantized = self.amount.quantize(exponent, rounding=ROUND_HALF_UP)
-        return str(int(quantized))
+        if minor_units == 0:
+            return str(int(quantized))
+        return f"{quantized:.{minor_units}f}"
 
     def __add__(self, other: Money) -> Money | None:
         if self.currency != other.currency:
-            return Money(self.amount + other.amount, self.currency)
+            raise TypeError("Currency mismatch")
+        return Money(self.amount + other.amount, self.currency)
