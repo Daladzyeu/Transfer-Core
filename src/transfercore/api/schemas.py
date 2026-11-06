@@ -1,5 +1,3 @@
-from _typeshed import SupportsRichComparison
-
 from pydantic import BaseModel, Field
 
 

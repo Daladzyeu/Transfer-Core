@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Request
 
 from transfercore.api.schemas import QuoteCreateRequest, QuoteResponse, MoneyModel
-from transfercore.domain.quote_engine import QuoteRequest
+from transfercore.domain.quote_engine import QuoteRequest, QuoteResult
 
 router = APIRouter(prefix="/quotes", tags=["quotes"])
 
 
-def quote_to_response(q: QuoteRequest) -> QuoteResponse:
+def quote_to_response(q: QuoteResult) -> QuoteResponse:
 
     return QuoteResponse(
         quote_id=q.quote_id,

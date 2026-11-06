@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from transfercore.domain.quote_engine import QuoteEngine
 from transfercore.api.quotes import router as quotes_router
-from transfercore.domain.store import InMemoryQuoteStore
+from transfercore.domain.storage import InMemoryQuoteStore
 
 
 def create_app(data_dir: Path | str = "data") -> FastAPI:
@@ -23,6 +23,8 @@ def create_app(data_dir: Path | str = "data") -> FastAPI:
 
     app = FastAPI(title="Transfer Core", lifespan=lifespan)
     app.include_router(quotes_router)
+
+    return app
 
 
 app = create_app()

@@ -13,7 +13,7 @@ class QuoteStore(Protocol):
     def get(self, quote_id: str, now: datetime | None = None) -> QuoteResult: ...
 
 
-class InMemoreQuoteStore:
+class InMemoryQuoteStore:
     def __init__(self):
         self.quotes_store: dict[str, QuoteResult] = {}
 
