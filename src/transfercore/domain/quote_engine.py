@@ -105,7 +105,7 @@ class ValidationError(QuoteError):
 class UnsupportedDirectionError(QuoteError):
     def __init__(self, message="Unsupported direction or payment method"):
         super().__init__(
-            "UNSUPPORTED DIRECTION", message
+            "UNSUPPORTED_DIRECTION", message
         )  # можно в details добавить словарь с direction {"src": ..., "target":} или с pay meth
 
 
@@ -118,7 +118,7 @@ class AmountBelowError(QuoteError):
         )
 
 
-class AmountAboveMax(QuoteError):
+class AmountAboveError(QuoteError):
     def __init__(self, max_val: str, currency: str):
         super().__init__(
             "AMOUNT_ABOVE_MAX", f"Amount above maximum: {max_val}", {"max": max_val}
@@ -130,24 +130,25 @@ class RateUnavailableError(QuoteError):
         super().__init__("RATE_UNAVAILABLE", f"No exchange rate for: {base}->{quote}")
 
 
+# Дописать messages и descriptions + дополнить своими ошибками
 class QuoteNotFoundError(QuoteError):
-    def __init__(self, message="Amount is above max"):
-        super().__init__("AMOUNT_ABOVE_MAX", message)
+    def __init__(self, message="Quote not found"):
+        super().__init__("QUOTE_NOTE_FOUND", message)
 
 
 class QuoteExpiredError(QuoteError):
-    def __init__(self, message="Amount is above max"):
-        super().__init__("AMOUNT_ABOVE_MAX", message)
+    def __init__(self, message="Quote expired"):
+        super().__init__("QUOTE_EXPIRED", message)
 
 
 class InsufficientFundsError(QuoteError):
-    def __init__(self, message="Amount is above max"):
-        super().__init__("AMOUNT_ABOVE_MAX", message)
+    def __init__(self, message=""):
+        super().__init__("INSUFFICIENT_FUNDS", message)
 
 
 class DailyLimitExceededError(QuoteError):
-    def __init__(self, message="Amount is above max"):
-        super().__init__("AMOUNT_ABOVE_MAX", message)
+    def __init__(self, message=""):
+        super().__init__("DAILY_LIMIT_EXCEEDED", message)
 
 
 class QuoteEngine:
@@ -195,46 +196,60 @@ class QuoteEngine:
             )
 
         amount = Decimal(request.amount)
+        percent = tariff.fee.percent / Decimal(100)
+        fee_currency = (
+            request.source_currency
+            if tariff.fee.charged_in == "SOURCE"
+            else request.target_currency
+        )
 
-        if amount < tariff.amount_limits.min:  # обернуть в Decimal иначе не пройдет
+        if amount < tariff.amount_limits.min:
             raise AmountBelowError(
-                min_val=tariff["amount_limits"]["min"],
-                currency=tariff["source"]["currency"],
+                min_val=tariff.amount_limits.min,
+                currency=tariff.source_currency,
             )
 
         if amount > tariff.amount_limits.max:
-            raise AmountAboveMax(
-                max_val=tariff["amount_limits"]["max"],
-                currency=tariff["source"]["currency"],
-            )  # не забыть название класса переименовать
+            raise AmountAboveError(
+                max_val=tariff.amount_limits.max,
+                currency=tariff.source_currency,
+            )
 
+        # Закомментить modes и как идет расчет
         if request.amount_type == tariff.fee.charged_in:
+            source_amount = amount
             if request.amount_type == "SOURCE":
-                raw_fee = tariff.fee.fixed + amount * (
-                    tariff.fee.percent / Decimal(100)
-                )
+                raw_fee = tariff.fee.fixed + amount * percent
                 fee = max(raw_fee, tariff.fee.min)
                 amount_to_convert = amount - fee
                 target_amount = amount_to_convert * rate
             else:
-                pass
+                gross = (amount + tariff.fee.fixed) / (1 - percent)
+                fee = gross - amount
+                amount_to_convert = gross / rate
+                target_amount = amount_to_convert
         else:
             if request.amount_type == "SOURCE":
+                source_amount = amount
                 amount_to_convert = amount
                 gross = amount * rate
-                raw_fee = tariff.fee.fixed + gross * (tariff.fee.percent / Decimal(100))
+                raw_fee = tariff.fee.fixed + gross * percent
                 fee = max(raw_fee, tariff.fee.min)
                 target_amount = gross - fee
             else:
-                pass
+                target_amount = amount
+                amount_to_convert = target_amount / rate
+                source_amount = (amount_to_convert + tariff.fee.fixed) / (1 - percent)
+                fee = source_amount - amount_to_convert
 
+        # пока что пример QuoteResult
         result = QuoteResult(
             quote_id="q_test_123",
             direction_id=tariff.direction_id,
             source_amount=Money.from_decimal(
-                amount, request.source_currency, self.registry
+                source_amount, request.source_currency, self.registry
             ),
-            fee=Money.from_decimal(fee, request.source_currency, self.registry),
+            fee=Money.from_decimal(fee, fee_currency, self.registry),
             amount_to_convert=Money.from_decimal(
                 amount_to_convert, request.source_currency, self.registry
             ),
