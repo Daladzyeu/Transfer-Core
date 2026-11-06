@@ -19,7 +19,7 @@ class CurrencyRegistry:
         self._precisions: dict[str, int] = dict(precisions or DEFAULT_CURRENCIES)
 
     @classmethod
-    def from_file(cls, path: Path | str) -> CurrencyRegistry:
+    def from_file(cls, path: Path | str = "data/currencies.json") -> CurrencyRegistry:
         json_path = Path(path)
         if not json_path.exists():
             return cls(DEFAULT_CURRENCIES)
@@ -33,7 +33,7 @@ class CurrencyRegistry:
         return self._precisions[currency]
 
 
-registry = CurrencyRegistry()
+registry = CurrencyRegistry().from_file()
 
 
 @dataclass(frozen=True)

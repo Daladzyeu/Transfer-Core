@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, status
 
 from transfercore.api.schemas import QuoteCreateRequest, QuoteResponse, MoneyModel
 from transfercore.domain.quote_engine import QuoteRequest, QuoteResult
@@ -27,7 +27,7 @@ def quote_to_response(q: QuoteResult) -> QuoteResponse:
     )
 
 
-@router.post("")
+@router.post("", status_code=status.HTTP_201_CREATED)
 async def create_quote(body: QuoteCreateRequest, request: Request):
     engine = request.app.state.quote_engine
     store = request.app.state.quote_store

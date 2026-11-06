@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from transfercore.domain.quote_engine import QuoteEngine
 from transfercore.api.quotes import router as quotes_router
 from transfercore.domain.storage import InMemoryQuoteStore
+from transfercore.domain.money import registry
 
 
 def create_app(data_dir: Path | str = "data") -> FastAPI:
@@ -17,7 +18,9 @@ def create_app(data_dir: Path | str = "data") -> FastAPI:
         tariffs = json.loads((path / "tariffs.json").read_text(encoding="utf-8"))
         rates = json.loads((path / "rates.json").read_text(encoding="utf-8"))
 
-        app.state.quote_engine = QuoteEngine(tariffs=tariffs, rates=rates)
+        app.state.quote_engine = QuoteEngine(
+            tariffs=tariffs, rates=rates, registry=registry
+        )
         app.state.quote_store = InMemoryQuoteStore()
         yield
 
@@ -27,4 +30,5 @@ def create_app(data_dir: Path | str = "data") -> FastAPI:
     return app
 
 
-app = create_app()
+def main():
+    app = create_app()

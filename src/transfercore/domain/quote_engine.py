@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, DecimalException
 
 from transfercore.domain.money import CurrencyRegistry, Money, registry
@@ -133,7 +134,7 @@ class RateUnavailableError(QuoteError):
 # Дописать messages и descriptions + дополнить своими ошибками
 class QuoteNotFoundError(QuoteError):
     def __init__(self, message="Quote not found"):
-        super().__init__("QUOTE_NOTE_FOUND", message)
+        super().__init__("QUOTE_NOT_FOUND", message)
 
 
 class QuoteExpiredError(QuoteError):
@@ -142,12 +143,12 @@ class QuoteExpiredError(QuoteError):
 
 
 class InsufficientFundsError(QuoteError):
-    def __init__(self, message=""):
+    def __init__(self, message="Insufficient funds"):
         super().__init__("INSUFFICIENT_FUNDS", message)
 
 
 class DailyLimitExceededError(QuoteError):
-    def __init__(self, message=""):
+    def __init__(self, message="Daily limit exceeded"):
         super().__init__("DAILY_LIMIT_EXCEEDED", message)
 
 
@@ -244,7 +245,7 @@ class QuoteEngine:
 
         # пока что пример QuoteResult
         result = QuoteResult(
-            quote_id="q_test_123",
+            quote_id="123",
             direction_id=tariff.direction_id,
             source_amount=Money.from_decimal(
                 source_amount, request.source_currency, self.registry
@@ -257,7 +258,9 @@ class QuoteEngine:
             target_amount=Money.from_decimal(
                 target_amount, request.target_currency, self.registry
             ),
-            breakdown=[f"fee: {fee}", f"rate: {rate}"],
-            expires_at="2026-11-06T12:00:00Z",
+            breakdown=None,  # Здесь можно динамически, исходя из условий сформировать шаги расчета, описанные выше, в зависимости от конфига SOURCE -> SOURCE ...
+            expires_at=datetime.isoformat(
+                datetime.now() + timedelta(seconds=tariff.quote_ttl_sec)
+            ),
         )
         return result
