@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 
 from transfercore.domain.money import CurrencyRegistry, Money, registry
 
@@ -26,6 +26,67 @@ class QuoteResult:
     target_amount: Money
     breakdown: list[str] | None
     expires_at: str
+
+
+@dataclass(frozen=True)
+class Fee:
+    percent: Decimal
+    fixed: Decimal
+    min: Decimal
+    charged_in: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Fee:
+        return cls(
+            percent=Decimal(data["percent"]),
+            fixed=Decimal(data["fixed"]),
+            min=Decimal(data["min"]),
+            charged_in=data["charged_in"],
+        )
+
+
+@dataclass(frozen=True)
+class Limits:
+    min: Decimal
+    max: Decimal
+    currency: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Limits:
+        return cls(
+            min=Decimal(data["min"]),
+            max=Decimal(data["max"]),
+            currency=data["currency"],
+        )
+
+
+@dataclass(frozen=True)
+class Tariff:
+    direction_id: str
+    source_country: str
+    source_currency: str
+    target_country: str
+    target_currency: str
+    payout_method: str
+    fee: Fee
+    amount_limits: Limits
+    min_margin_percent: Decimal
+    quote_ttl_sec: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Tariff:
+        return cls(
+            direction_id=data["direction_id"],
+            source_country=data["source"]["country"],
+            source_currency=data["source"]["currency"],
+            target_country=data["target"]["country"],
+            target_currency=data["target"]["currency"],
+            payout_method=data["payout_method"],
+            fee=Fee.from_dict(data["fee"]),
+            amount_limits=Limits.from_dict(data["amount_limits"]),
+            min_margin_percent=Decimal(data["min_margin_percent"]),
+            quote_ttl_sec=data["quote_ttl_sec"],
+        )
 
 
 class QuoteError(Exception):
@@ -92,21 +153,25 @@ class DailyLimitExceededError(QuoteError):
 class QuoteEngine:
     def __init__(
         self,
-        tariffs: list[dict],
+        tariffs: list[Tariff] | list[dict],
         rates: list[dict],
         registry: CurrencyRegistry = registry,
     ):
-        self.tariffs = tariffs
+        parsed_tariffs = [
+            t if isinstance(t, Tariff) else Tariff.from_dict(t) for t in tariffs
+        ]
+
+        self.tariffs = parsed_tariffs
         self.rates = {(r["base"], r["quote"]): Decimal(r["rate"]) for r in rates}
         self.registry = registry
         self._tariffs_by_route = {}  # Пометить где-нибудь в доках, что это для быстрого поиска/проверки доступных direction`ов
-        for t in tariffs:
+        for t in parsed_tariffs:
             key = (
-                t["source"]["country"],
-                t["source"]["currency"],
-                t["target"]["country"],
-                t["target"]["currency"],
-                t["payout_method"],
+                t.source_country,
+                t.source_currency,
+                t.target_country,
+                t.target_currency,
+                t.payout_method,
             )
             self._tariffs_by_route[key] = t
 
@@ -118,58 +183,56 @@ class QuoteEngine:
             request.target_currency,
             request.payout_method,
         )
+
         tariff = self._tariffs_by_route.get(request_key)
         if not tariff:
             raise UnsupportedDirectionError()
+
         rate = self.rates.get((request.source_currency, request.target_currency))
         if not rate:
             raise RateUnavailableError(
                 base=request.source_currency, quote=request.target_currency
             )
 
-        if Decimal(request.amount) < Decimal(
-            tariff["amount_limits"]["min"]
-        ):  # обернуть в Decimal иначе не пройдет
+        amount = Decimal(request.amount)
+
+        if amount < tariff.amount_limits.min:  # обернуть в Decimal иначе не пройдет
             raise AmountBelowError(
                 min_val=tariff["amount_limits"]["min"],
                 currency=tariff["source"]["currency"],
             )
 
-        if Decimal(request.amount) > Decimal(tariff["amount_limits"]["max"]):
+        if amount > tariff.amount_limits.max:
             raise AmountAboveMax(
                 max_val=tariff["amount_limits"]["max"],
                 currency=tariff["source"]["currency"],
             )  # не забыть название класса переименовать
 
-        # if request.amount_type == tariff["fee"]["charged_in"]:
-        #    if request.amount_type == "SOURCE":
-        #         raw_fee = (
-        #             tariff["fee"]["fixed"]
-        #            + Decimal(request.amount) * Decimal(tariff["fee"]["percent"])
-        #       )  # можно обернуть данные с json по датаклассам типа fee, tariff, limits где они сразу в Decimal будут
-        #       fee = min(raw_fee, tariff["fee"]["fixed"])
-        #       amount_to_convert = request.amount - fee
-        #      target_amount = amount_to_convert * rate
-        # else:
-        #     pass
-        #    else:
-        #        if request.amount_type == "SOURCE":
-        #           pass
-        #      else:
-        #          pass
-        raw_fee = (
-            Decimal(tariff["fee"]["fixed"])
-            + Decimal(request.amount) * Decimal(tariff["fee"]["percent"])
-        )  # можно обернуть данные с json по датаклассам типа fee, tariff, limits где они сразу в Decimal будут
-        fee = max(raw_fee, Decimal(tariff["fee"]["fixed"]))
-        amount_to_convert = Decimal(request.amount) - fee
-        target_amount = amount_to_convert * rate
+        if request.amount_type == tariff.fee.charged_in:
+            if request.amount_type == "SOURCE":
+                raw_fee = tariff.fee.fixed + amount * (
+                    tariff.fee.percent / Decimal(100)
+                )
+                fee = max(raw_fee, tariff.fee.min)
+                amount_to_convert = amount - fee
+                target_amount = amount_to_convert * rate
+            else:
+                pass
+        else:
+            if request.amount_type == "SOURCE":
+                amount_to_convert = amount
+                gross = amount * rate
+                raw_fee = tariff.fee.fixed + gross * (tariff.fee.percent / Decimal(100))
+                fee = max(raw_fee, tariff.fee.min)
+                target_amount = gross - fee
+            else:
+                pass
 
         result = QuoteResult(
             quote_id="q_test_123",
-            direction_id=tariff["direction_id"],
+            direction_id=tariff.direction_id,
             source_amount=Money.from_decimal(
-                Decimal(request.amount), request.source_currency, self.registry
+                amount, request.source_currency, self.registry
             ),
             fee=Money.from_decimal(fee, request.source_currency, self.registry),
             amount_to_convert=Money.from_decimal(
