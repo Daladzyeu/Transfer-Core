@@ -8,10 +8,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 
 from transfercore.domain.quote_engine import QuoteEngine, QuoteError
+from transfercore.domain.money import CurrencyRegistry, registry
 from transfercore.api.quotes import router as quotes_router
-from transfercore.domain.storage import InMemoryQuoteStore
-from transfercore.domain.money import registry
-from transfercore.infrastructure.db import get_db
+from transfercore.api.clients import router as clients_router
+from transfercore.infrastructure.db import AsyncSessionLocal
+from transfercore.infrastructure.repositories import BalanceRepository
 
 
 def create_app(data_dir: Path | str = "data") -> FastAPI:
@@ -21,22 +22,48 @@ def create_app(data_dir: Path | str = "data") -> FastAPI:
         tariffs = json.loads((path / "tariffs.json").read_text(encoding="utf-8"))
         rates = json.loads((path / "rates.json").read_text(encoding="utf-8"))
 
+        currencies_file = path / "currencies.json"
+        if currencies_file.exists():
+            app.state.currency_registry = CurrencyRegistry.from_file(currencies_file)
+        else:
+            app.state.currency_registry = registry
+
         app.state.quote_engine = QuoteEngine(
-            tariffs=tariffs, rates=rates, registry=registry
+            tariffs=tariffs, rates=rates, registry=app.state.currency_registry
         )
+
+        clients_file = path / "clients.json"
+        if clients_file.exists():
+            clients = json.loads(clients_file.read_text(encoding="utf-8"))
+            app.state.clients = {c["client_id"]: c for c in clients}
+            try:
+                async with AsyncSessionLocal() as session:
+                    await BalanceRepository.seed_balances(session, clients)
+            except Exception:
+                pass
+        else:
+            app.state.clients = {}
+
         yield
 
     app = FastAPI(title="Transfer Core", lifespan=lifespan)
     app.include_router(quotes_router)
+    app.include_router(clients_router)
 
     @app.exception_handler(QuoteError)
     async def handle_quote_error(request: Request, exc: QuoteError):
         status_code = 400
-        if exc.code in ("QUOTE_NOT_FOUND", "UNSUPPORTED_DIRECTION"):
+        if exc.code in ("QUOTE_NOT_FOUND", "UNSUPPORTED_DIRECTION", "CLIENT_NOT_FOUND"):
             status_code = 404
         elif exc.code == "QUOTE_EXPIRED":
             status_code = 410
-        elif exc.code in ("AMOUNT_BELOW_MIN", "AMOUNT_ABOVE_MAX", "VALIDATION_ERROR"):
+        elif exc.code in (
+            "AMOUNT_BELOW_MIN",
+            "AMOUNT_ABOVE_MAX",
+            "VALIDATION_ERROR",
+            "INSUFFICIENT_FUNDS",
+            "DAILY_LIMIT_EXCEEDED",
+        ):
             status_code = 422
 
         return JSONResponse(
