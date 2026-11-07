@@ -1,0 +1,3 @@
+[database]
+url="driver://user:pass@host:port/db_name"
+
