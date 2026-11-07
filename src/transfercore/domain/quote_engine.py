@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException
 
 from transfercore.domain.money import CurrencyRegistry, Money, registry
@@ -243,6 +243,8 @@ class QuoteEngine:
                 source_amount = (amount_to_convert + tariff.fee.fixed) / (1 - percent)
                 fee = source_amount - amount_to_convert
 
+        dt = datetime.now(timezone.utc) + timedelta(seconds=tariff.quote_ttl_sec)
+
         # пока что пример QuoteResult
         result = QuoteResult(
             quote_id="123",
@@ -259,8 +261,6 @@ class QuoteEngine:
                 target_amount, request.target_currency, self.registry
             ),
             breakdown=None,  # Здесь можно динамически, исходя из условий сформировать шаги расчета, описанные выше, в зависимости от конфига SOURCE -> SOURCE ...
-            expires_at=datetime.isoformat(
-                datetime.now() + timedelta(seconds=tariff.quote_ttl_sec)
-            ),
+            expires_at=dt.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         )
         return result
