@@ -1,3 +1,7 @@
+import os
+import socket
+import tomllib
+from pathlib import Path
 from typing import Any, Tuple, Type
 from pydantic import BaseModel
 from pydantic_settings import (
@@ -6,45 +10,57 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from pathlib import Path
-import tomllib
+
+def normalize_database_url(url: str) -> str:
+    """Ensure asyncpg driver is specified and fallback to localhost if 'db' is unresolvable."""
+    if url.startswith("postgresql://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+    if "@db:" in url:
+        try:
+            socket.gethostbyname("db")
+        except socket.gaierror:
+            url = url.replace("@db:", "@localhost:", 1)
+    return url
 
 
 class DatabaseConfig(BaseModel):
     url: str
-    echo: bool
+    echo: bool = False
+
+    def __init__(self, **data: Any):
+        if "url" in data and isinstance(data["url"], str):
+            data["url"] = normalize_database_url(data["url"])
+        super().__init__(**data)
 
 
 class TomlConfigSettingsSource(PydanticBaseSettingsSource):
-    """
-    Источник для чтения настроек из TOML-файла.
-    """
+    """Source for reading settings from settings.toml."""
 
     def get_field_value(self, field: Any, field_name: str) -> Tuple[Any, str, bool]:
         return None, field_name, False
 
     def __call__(self) -> dict[str, Any]:
-        # Вариант 1: Ищем settings.toml в корне проекта (на несколько уровней выше от этого файла)
-        # Если этот файл лежит в src/orsha_geo_bot/config.py, то корень на 3 уровня выше:
-        # Path(__file__).resolve().parent.parent.parent / "settings.toml"
-
-        # Вариант 2 (более универсальный): Ищем от текущей рабочей директории (откуда запускаете скрипт)
         file_path = Path.cwd() / "settings.toml"
-
-        # Если не нашли в текущей директории, можно попробовать найти относительно самого файла:
         if not file_path.exists():
-            # Подстройте количество .parent в зависимости от глубины вложения вашего файла конфигурации
             file_path = Path(__file__).resolve().parent.parent.parent / "settings.toml"
 
         if not file_path.exists():
             return {}
 
         with file_path.open("rb") as f:
-            return tomllib.load(f)
+            data = tomllib.load(f)
+            if "database" in data and "url" in data["database"]:
+                data["database"]["url"] = normalize_database_url(data["database"]["url"])
+            return data
 
 
 class Settings(BaseSettings):
-    database: DatabaseConfig
+    database: DatabaseConfig = DatabaseConfig(
+        url=normalize_database_url(
+            os.environ.get("DATABASE_URL")
+            or "postgresql+asyncpg://transfer:transfer@localhost:5432/transfer"
+        )
+    )
 
     model_config = SettingsConfigDict(
         env_nested_delimiter="__",
@@ -60,10 +76,9 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Environment variables take precedence over TOML file
         return (
-            init_settings,
-            TomlConfigSettingsSource(
-                settings_cls
-            ),  # Ставим TOML выше env, чтобы файл читал нормально
             env_settings,
+            init_settings,
+            TomlConfigSettingsSource(settings_cls),
         )

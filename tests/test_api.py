@@ -1,6 +1,10 @@
+from decimal import Decimal
 import pytest
 from httpx import AsyncClient, ASGITransport
 from transfercore.api.app import create_app
+from transfercore.infrastructure.db import AsyncSessionLocal
+from transfercore.infrastructure.repositories import BalanceRepository
+from transfercore.domain.quote_engine import InsufficientFundsError
 
 
 @pytest.mark.anyio
@@ -32,3 +36,66 @@ async def test_post_and_get_quote_via_http():
             get_resp = await client.get(f"/quotes/{quote_id}")
             assert get_resp.status_code == 200
             assert get_resp.json()["quote_id"] == quote_id
+
+
+@pytest.mark.anyio
+async def test_get_client_balance():
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # Test existing seeded client
+            resp = await client.get("/clients/c_001/balance")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["client_id"] == "c_001"
+            assert "RUB" in data["balances"]
+            assert Decimal(data["balances"]["RUB"]["available"]) > Decimal("0")
+            assert data["balances"]["RUB"]["reserved"] == "0.00"
+
+            # Test unknown client
+            not_found_resp = await client.get("/clients/c_unknown_999/balance")
+            assert not_found_resp.status_code == 404
+            err_data = not_found_resp.json()
+            assert err_data["error"]["code"] == "CLIENT_NOT_FOUND"
+
+
+@pytest.mark.anyio
+async def test_balance_hold_and_release_invariants():
+    """Verify available + reserved invariant during hold and release."""
+    async with AsyncSessionLocal() as session:
+        # Check starting state for c_001
+        async with session.begin():
+            balances = await BalanceRepository.get_balances_by_client(session, "c_001")
+            rub_balance = next(b for b in balances if b.currency == "RUB")
+            start_available = rub_balance.available
+            start_reserved = rub_balance.reserved
+
+        hold_amount = Decimal("1000.00")
+
+        # 1. Place hold
+        async with session.begin():
+            await BalanceRepository.hold_funds(session, "c_001", "RUB", hold_amount)
+
+        async with session.begin():
+            b1 = await BalanceRepository.get_balance_for_update(session, "c_001", "RUB")
+            assert b1.available == start_available - hold_amount
+            assert b1.reserved == start_reserved + hold_amount
+            assert b1.available + b1.reserved == start_available + start_reserved
+
+        # 2. Release hold (simulating failed transfer refund)
+        async with session.begin():
+            await BalanceRepository.release_hold(session, "c_001", "RUB", hold_amount)
+
+        async with session.begin():
+            b2 = await BalanceRepository.get_balance_for_update(session, "c_001", "RUB")
+            assert b2.available == start_available
+            assert b2.reserved == start_reserved
+
+        # 3. Test holding more than available raises InsufficientFundsError
+        with pytest.raises(InsufficientFundsError):
+            async with session.begin():
+                await BalanceRepository.hold_funds(
+                    session, "c_001", "RUB", Decimal("99999999.00")
+                )

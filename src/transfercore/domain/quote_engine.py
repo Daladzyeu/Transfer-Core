@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException
+import uuid
 
 from transfercore.domain.money import CurrencyRegistry, Money, registry
 
@@ -247,7 +248,7 @@ class QuoteEngine:
 
         # пока что пример QuoteResult
         result = QuoteResult(
-            quote_id="123",
+            quote_id=f"q_{uuid.uuid4().hex[:12]}",
             direction_id=tariff.direction_id,
             source_amount=Money.from_decimal(
                 source_amount, request.source_currency, self.registry

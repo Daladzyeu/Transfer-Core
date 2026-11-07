@@ -1,11 +1,16 @@
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
+from sqlalchemy.pool import NullPool
 from transfercore.config import Settings
 
 settings = Settings()
 
-engine = create_async_engine(settings.database.url, echo=settings.database.echo)
+engine = create_async_engine(
+    settings.database.url,
+    echo=settings.database.echo,
+    poolclass=NullPool,
+)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 Base = declarative_base()
 
