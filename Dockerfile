@@ -20,7 +20,7 @@ COPY . .
 RUN uv pip install -v --system -e .
 
 
-EXPOSE 8000
+EXPOSE 8080
 
 # Default FastAPI uvicorn execution
-CMD ["uvicorn", "transfercore.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "transfercore.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]

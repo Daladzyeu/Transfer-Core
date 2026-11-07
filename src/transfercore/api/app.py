@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
@@ -11,6 +11,7 @@ from transfercore.domain.quote_engine import QuoteEngine, QuoteError
 from transfercore.api.quotes import router as quotes_router
 from transfercore.domain.storage import InMemoryQuoteStore
 from transfercore.domain.money import registry
+from transfercore.infrastructure.db import get_db
 
 
 def create_app(data_dir: Path | str = "data") -> FastAPI:
@@ -23,7 +24,6 @@ def create_app(data_dir: Path | str = "data") -> FastAPI:
         app.state.quote_engine = QuoteEngine(
             tariffs=tariffs, rates=rates, registry=registry
         )
-        app.state.quote_store = InMemoryQuoteStore()
         yield
 
     app = FastAPI(title="Transfer Core", lifespan=lifespan)
