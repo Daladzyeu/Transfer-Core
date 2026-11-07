@@ -1,11 +1,11 @@
-FROM python:3.14-rc-slim
+FROM python:3.14-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install system dependencies required for compiling Python packages
+# Build dependencies for packages without cp314 wheels.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     build-essential \
@@ -13,14 +13,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir uv
 
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 
 COPY . .
-# Added -v for verbose output to prevent silent hanging
-RUN uv pip install -v --system -e .
+RUN uv pip install --system --no-cache -e ".[dev]"
 
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 EXPOSE 8080
 
-# Default FastAPI uvicorn execution
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["uvicorn", "transfercore.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]

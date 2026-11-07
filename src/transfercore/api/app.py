@@ -1,8 +1,9 @@
 import json
+import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
@@ -11,14 +12,21 @@ from transfercore.domain.quote_engine import QuoteEngine, QuoteError
 from transfercore.domain.money import CurrencyRegistry, registry
 from transfercore.api.quotes import router as quotes_router
 from transfercore.api.clients import router as clients_router
+from transfercore.api.transfers import router as transfers_router
 from transfercore.infrastructure.db import AsyncSessionLocal
 from transfercore.infrastructure.repositories import BalanceRepository
+from decimal import Decimal
 
 
-def create_app(data_dir: Path | str = "data") -> FastAPI:
+def create_app(data_dir: Path | str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        path = Path(data_dir)
+        path = Path(data_dir) if data_dir is not None else Path(
+            os.environ.get("DATA_DIR", "data")
+        )
+        if not path.exists():
+            raise RuntimeError(f"DATA_DIR does not exist: {path}")
+
         tariffs = json.loads((path / "tariffs.json").read_text(encoding="utf-8"))
         rates = json.loads((path / "rates.json").read_text(encoding="utf-8"))
 
@@ -32,15 +40,22 @@ def create_app(data_dir: Path | str = "data") -> FastAPI:
             tariffs=tariffs, rates=rates, registry=app.state.currency_registry
         )
 
+        app.state.rates_map = {
+            (r["base"], r["quote"]): Decimal(r["rate"]) for r in rates
+        }
+
+        providers_file = path / "providers.json"
+        if providers_file.exists():
+            app.state.providers = json.loads(providers_file.read_text(encoding="utf-8"))
+        else:
+            app.state.providers = []
+
         clients_file = path / "clients.json"
         if clients_file.exists():
             clients = json.loads(clients_file.read_text(encoding="utf-8"))
             app.state.clients = {c["client_id"]: c for c in clients}
-            try:
-                async with AsyncSessionLocal() as session:
-                    await BalanceRepository.seed_balances(session, clients)
-            except Exception:
-                pass
+            async with AsyncSessionLocal() as session:
+                await BalanceRepository.seed_balances(session, clients)
         else:
             app.state.clients = {}
 
@@ -49,6 +64,11 @@ def create_app(data_dir: Path | str = "data") -> FastAPI:
     app = FastAPI(title="Transfer Core", lifespan=lifespan)
     app.include_router(quotes_router)
     app.include_router(clients_router)
+    app.include_router(transfers_router)
+
+    @app.get("/health", tags=["health"])
+    async def health():
+        return {"status": "ok"}
 
     @app.exception_handler(QuoteError)
     async def handle_quote_error(request: Request, exc: QuoteError):
@@ -96,4 +116,11 @@ def create_app(data_dir: Path | str = "data") -> FastAPI:
 
 
 def main():
-    app = create_app()
+    import uvicorn
+
+    uvicorn.run(
+        "transfercore.api.app:create_app",
+        factory=True,
+        host="0.0.0.0",
+        port=8080,
+    )

@@ -11,9 +11,9 @@ from transfercore.domain.quote_engine import (
     QuoteNotFoundError,
     QuoteExpiredError,
 )
-from transfercore.infrastructure.tables import ClientBalance, Quotes
+from transfercore.infrastructure.tables import ClientBalance, Quotes, Transfers, TransferState
 from transfercore.domain.money import Money
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 class QuoteRepository:
@@ -185,3 +185,79 @@ class BalanceRepository:
         balance.reserved -= amount
         session.add(balance)
         return balance
+
+
+class TransferRepository:
+    @staticmethod
+    async def get_by_id(session: AsyncSession, transfer_id: str) -> Transfers | None:
+        stmt = select(Transfers).where(Transfers.transfer_id == transfer_id)
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_idempotency_key(
+        session: AsyncSession, idempotency_key: str
+    ) -> Transfers | None:
+        stmt = select(Transfers).where(Transfers.idempotency_key == idempotency_key)
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def calculate_24h_spent(session: AsyncSession, client_id: str) -> Decimal:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        stmt = (
+            select(func.coalesce(func.sum(Transfers.source_amount), Decimal("0")))
+            .where(
+                Transfers.client_id == client_id,
+                Transfers.status.in_([TransferState.PROCESSING, TransferState.COMPLETED]),
+                Transfers.created_at >= cutoff,
+            )
+        )
+        total = await session.scalar(stmt)
+        return Decimal(str(total or 0))
+
+    @staticmethod
+    async def create_transfer(
+        session: AsyncSession,
+        transfer: Transfers,
+    ) -> Transfers:
+        session.add(transfer)
+        await session.commit()
+        await session.refresh(transfer)
+        return transfer
+
+    @staticmethod
+    async def record_attempt_and_status(
+        session: AsyncSession,
+        transfer_id: str,
+        new_status: TransferState,
+        attempt: dict | None = None,
+    ) -> Transfers | None:
+        stmt = select(Transfers).where(Transfers.transfer_id == transfer_id).with_for_update()
+        result = await session.execute(stmt)
+        transfer = result.scalar_one_or_none()
+        if not transfer:
+            return None
+
+        # Record state transition
+        transitions = list(transfer.transitions or [])
+        transitions.append(
+            {
+                "from": transfer.status.value,
+                "to": new_status.value,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        transfer.status = new_status
+        transfer.transitions = transitions
+
+        # Record provider attempt
+        if attempt:
+            attempts = list(transfer.attempts or [])
+            attempts.append(attempt)
+            transfer.attempts = attempts
+
+        session.add(transfer)
+        await session.commit()
+        await session.refresh(transfer)
+        return transfer

@@ -7,6 +7,7 @@ services:
       DATABASE_URL: postgresql://transfer:transfer@db:5432/transfer
       MOCK_PROVIDER_URL: http://mock-provider:9000
       PROVIDER_WEBHOOK_SECRET: ${PROVIDER_WEBHOOK_SECRET:-local-dev-webhook-secret}
+      CALLBACK_BASE_URL: http://api:8080
       DATA_DIR: /data
     volumes:
       - ./data:/data:ro
@@ -15,6 +16,12 @@ services:
         condition: service_healthy
       mock-provider:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
 
   db:
     image: postgres:16.4-alpine
@@ -52,6 +59,42 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  db-test:
+    image: postgres:16.4-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: transfer
+      POSTGRES_PASSWORD: transfer
+      POSTGRES_DB: transfer
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U transfer -d transfer"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  test:
+    build: .
+    profiles: ["test"]
+    environment:
+      DATABASE_URL: postgresql://transfer:transfer@db-test:5432/transfer
+      MOCK_PROVIDER_URL: http://mock-provider:9000
+      PROVIDER_WEBHOOK_SECRET: local-dev-webhook-secret
+      CALLBACK_BASE_URL: http://test:8080
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data:ro
+      - ./examples:/app/examples:ro
+      - ./tests:/app/tests:ro
+      - ./scripts:/app/scripts:ro
+    depends_on:
+      db-test:
+        condition: service_healthy
+      mock-provider:
+        condition: service_healthy
+    command: ["python", "-m", "pytest", "-q"]
 
 volumes:
   pgdata:

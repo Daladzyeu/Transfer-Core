@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 
 from transfercore.config import Settings
-from transfercore.infrastructure.db.db import Base
-from transfercore.infrastructure.db.tables import (
+from transfercore.infrastructure.db import Base
+from transfercore.infrastructure.tables import (
     ClientBalance,
     Quotes,
     Transfers,

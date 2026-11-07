@@ -99,3 +99,75 @@ async def test_balance_hold_and_release_invariants():
                 await BalanceRepository.hold_funds(
                     session, "c_001", "RUB", Decimal("99999999.00")
                 )
+
+
+@pytest.mark.anyio
+async def test_transfer_creation_and_idempotency_flow():
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # 1. Create a Quote first
+            quote_resp = await client.post(
+                "/quotes",
+                json={
+                    "source_country": "RU",
+                    "source_currency": "RUB",
+                    "target_country": "TH",
+                    "target_currency": "THB",
+                    "payout_method": "BANK_ACCOUNT",
+                    "amount": "5000.00",
+                    "amount_type": "SOURCE",
+                },
+            )
+            assert quote_resp.status_code == 201
+            quote_id = quote_resp.json()["quote_id"]
+
+            transfer_body = {
+                "quote_id": quote_id,
+                "client_id": "c_001",
+                "recipient": {
+                    "name": "Somchai Jaidee",
+                    "account": "1234567890",
+                    "bank_code": "BKKB",
+                },
+            }
+
+            # 2. Submit transfer with Idempotency-Key
+            idemp_key = f"key-{quote_id}"
+            resp1 = await client.post(
+                "/transfers",
+                json=transfer_body,
+                headers={"Idempotency-Key": idemp_key},
+            )
+            assert resp1.status_code == 201
+            data1 = resp1.json()
+            transfer_id = data1["transfer_id"]
+            assert transfer_id.startswith("tr_")
+            assert data1["status"] in ("PROCESSING", "COMPLETED")
+            assert data1["source_amount"]["amount"] == "5000.00"
+
+            # 3. Submit identical transfer with the SAME Idempotency-Key
+            resp2 = await client.post(
+                "/transfers",
+                json=transfer_body,
+                headers={"Idempotency-Key": idemp_key},
+            )
+            assert resp2.status_code == 201
+            data2 = resp2.json()
+            # Must return the EXACT same transfer!
+            assert data2["transfer_id"] == transfer_id
+
+            # 4. GET /transfers/{transfer_id}
+            get_resp = await client.get(f"/transfers/{transfer_id}")
+            assert get_resp.status_code == 200
+            get_data = get_resp.json()
+            assert get_data["transfer_id"] == transfer_id
+            assert get_data["status"] == data1["status"]
+            assert len(get_data["attempts"]) > 0
+
+            # 5. Missing Idempotency-Key header raises 422
+            err_resp = await client.post("/transfers", json=transfer_body)
+            assert err_resp.status_code == 422
+            assert err_resp.json()["error"]["code"] == "VALIDATION_ERROR"

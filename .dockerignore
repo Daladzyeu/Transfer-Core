@@ -8,3 +8,7 @@ __pycache__/
 .git/
 .gitignore
 tests/
+Backend.pdf
+Backend.txt
+settings.toml
+pgdata/

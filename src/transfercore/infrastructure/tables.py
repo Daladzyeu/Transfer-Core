@@ -43,6 +43,11 @@ class Transfers(Base):
     status = Column(Enum(TransferState, name="transfer_state"), nullable=False)
     source_amount = Column(Numeric(precision=20, scale=10))
     source_currency = Column(String)
+    target_amount = Column(Numeric(precision=20, scale=10))
+    target_currency = Column(String)
+    recipient = Column(JSONB)
+    attempts = Column(JSONB, default=list)
+    transitions = Column(JSONB, default=list)
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

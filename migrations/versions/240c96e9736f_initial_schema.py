@@ -43,6 +43,11 @@ def upgrade() -> None:
     sa.Column('status', sa.Enum('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', name='transfer_state'), nullable=False),
     sa.Column('source_amount', sa.Numeric(precision=20, scale=10), nullable=True),
     sa.Column('source_currency', sa.String(), nullable=True),
+    sa.Column('target_amount', sa.Numeric(precision=20, scale=10), nullable=True),
+    sa.Column('target_currency', sa.String(), nullable=True),
+    sa.Column('recipient', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    sa.Column('attempts', postgresql.JSONB(astext_type=sa.Text()), server_default='[]', nullable=True),
+    sa.Column('transitions', postgresql.JSONB(astext_type=sa.Text()), server_default='[]', nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.PrimaryKeyConstraint('transfer_id'),
     sa.UniqueConstraint('idempotency_key')
