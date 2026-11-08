@@ -103,7 +103,11 @@ async def test_balance_hold_and_release_invariants():
 
 @pytest.mark.anyio
 async def test_transfer_creation_and_idempotency_flow():
-    app = create_app()
+    from transfercore.infrastructure.transfer_worker import TransferWorker
+    from fakes import FakeProviderClient
+
+    app = create_app(start_worker=False)
+    fake = FakeProviderClient()
     async with app.router.lifespan_context(app):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
@@ -134,19 +138,21 @@ async def test_transfer_creation_and_idempotency_flow():
                 },
             }
 
-            # 2. Submit transfer with Idempotency-Key
+            # 2. Submit transfer with Idempotency-Key. The API accepts the
+            #    request and leaves processing to the background worker.
             idemp_key = f"key-{quote_id}"
             resp1 = await client.post(
                 "/transfers",
                 json=transfer_body,
                 headers={"Idempotency-Key": idemp_key},
             )
-            assert resp1.status_code == 201
+            assert resp1.status_code == 202
             data1 = resp1.json()
             transfer_id = data1["transfer_id"]
             assert transfer_id.startswith("tr_")
-            assert data1["status"] in ("PROCESSING", "COMPLETED")
+            assert data1["status"] == "PENDING"
             assert data1["source_amount"]["amount"] == "5000.00"
+            assert fake.calls == []
 
             # 3. Submit identical transfer with the SAME Idempotency-Key
             resp2 = await client.post(
@@ -154,20 +160,36 @@ async def test_transfer_creation_and_idempotency_flow():
                 json=transfer_body,
                 headers={"Idempotency-Key": idemp_key},
             )
-            assert resp2.status_code == 201
+            assert resp2.status_code == 202
+            assert resp2.headers["Idempotency-Replayed"] == "true"
             data2 = resp2.json()
             # Must return the EXACT same transfer!
             assert data2["transfer_id"] == transfer_id
 
-            # 4. GET /transfers/{transfer_id}
+            # 4. The worker dispatches the pending transfer.
+            worker = TransferWorker(app.state, provider_client=fake)
+            assert await worker.process_pending() == 1
+            assert [call.provider_id for call in fake.calls] == ["prov_alpha"]
+
+            # 5. GET /transfers/{transfer_id}
             get_resp = await client.get(f"/transfers/{transfer_id}")
             assert get_resp.status_code == 200
             get_data = get_resp.json()
             assert get_data["transfer_id"] == transfer_id
-            assert get_data["status"] == data1["status"]
-            assert len(get_data["attempts"]) > 0
+            assert get_data["status"] == "PROCESSING"
+            assert get_data["provider_id"] == "prov_alpha"
+            assert len(get_data["attempts"]) == 1
+            assert [t["to"] for t in get_data["transitions"]] == [
+                "PENDING",
+                "PROCESSING",
+            ]
 
-            # 5. Missing Idempotency-Key header raises 422
+            # 6. Missing Idempotency-Key header raises 422
             err_resp = await client.post("/transfers", json=transfer_body)
             assert err_resp.status_code == 422
             assert err_resp.json()["error"]["code"] == "VALIDATION_ERROR"
+
+            # 7. Unknown transfer is a 404
+            missing = await client.get("/transfers/tr_missing")
+            assert missing.status_code == 404
+            assert missing.json()["error"]["code"] == "TRANSFER_NOT_FOUND"

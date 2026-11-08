@@ -1,17 +1,32 @@
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from transfercore.domain.money import CurrencyRegistry, Money, registry
 from transfercore.domain.quote_engine import (
     InsufficientFundsError,
-    QuoteResult,
-    QuoteNotFoundError,
     QuoteExpiredError,
+    QuoteNotFoundError,
+    QuoteResult,
+    RateUnavailableError,
 )
-from transfercore.infrastructure.tables import ClientBalance, Quotes, Transfers, TransferState
-from transfercore.domain.money import CurrencyRegistry, Money, registry
-from datetime import datetime, timedelta, timezone
+from transfercore.domain.rates import RateNotAvailable, RateService
+from transfercore.infrastructure.tables import (
+    ClientBalance,
+    Quotes,
+    Transfers,
+    TransferState,
+)
+
+COUNTED_DAILY_LIMIT_STATES = (
+    TransferState.PENDING,
+    TransferState.PROCESSING,
+    TransferState.COMPLETED,
+    TransferState.NEEDS_REVIEW,
+)
 
 
 class QuoteRepository:
@@ -208,6 +223,23 @@ class TransferRepository:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def get_by_id_for_update(
+        session: AsyncSession, transfer_id: str
+    ) -> Transfers | None:
+        stmt = (
+            select(Transfers)
+            .where(Transfers.transfer_id == transfer_id)
+            .with_for_update()
+            # A caller may already have loaded this transfer earlier in the
+            # same session (dispatch, webhook validation). Settlement must
+            # always act on the committed row, otherwise a slow provider
+            # response can overwrite a webhook that arrived in the meantime.
+            .execution_options(populate_existing=True)
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    @staticmethod
     async def get_by_idempotency_key(
         session: AsyncSession, idempotency_key: str
     ) -> Transfers | None:
@@ -216,28 +248,134 @@ class TransferRepository:
         return result.scalar_one_or_none()
 
     @staticmethod
-    async def calculate_24h_spent(session: AsyncSession, client_id: str) -> Decimal:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        stmt = (
-            select(func.coalesce(func.sum(Transfers.source_amount), Decimal("0")))
-            .where(
-                Transfers.client_id == client_id,
-                Transfers.status.in_([TransferState.PROCESSING, TransferState.COMPLETED]),
-                Transfers.created_at >= cutoff,
-            )
-        )
-        total = await session.scalar(stmt)
-        return Decimal(str(total or 0))
-
-    @staticmethod
-    async def create_transfer(
+    async def create_pending_transfer(
         session: AsyncSession,
         transfer: Transfers,
-    ) -> Transfers:
-        session.add(transfer)
+    ) -> tuple[Transfers, bool]:
+        """Insert a transfer, or return the existing one for a repeated key.
+
+        The unique index on ``idempotency_key`` makes concurrent submissions
+        safe: the second insert blocks until the first transaction commits and
+        then returns no row.
+        """
+        stmt = (
+            pg_insert(Transfers)
+            .values(
+                transfer_id=transfer.transfer_id,
+                quote_id=transfer.quote_id,
+                client_id=transfer.client_id,
+                idempotency_key=transfer.idempotency_key,
+                request_fingerprint=transfer.request_fingerprint,
+                status=transfer.status,
+                direction_id=transfer.direction_id,
+                source_amount=transfer.source_amount,
+                source_currency=transfer.source_currency,
+                fee_amount=transfer.fee_amount,
+                fee_currency=transfer.fee_currency,
+                target_amount=transfer.target_amount,
+                target_currency=transfer.target_currency,
+                recipient=transfer.recipient,
+                attempts=transfer.attempts or [],
+                transitions=transfer.transitions or [],
+            )
+            .on_conflict_do_nothing(index_elements=["idempotency_key"])
+            .returning(Transfers.transfer_id)
+        )
+        inserted_id = (await session.execute(stmt)).scalar_one_or_none()
+        if inserted_id is None:
+            existing = await TransferRepository.get_by_idempotency_key(
+                session, transfer.idempotency_key
+            )
+            return existing, False
+
+        created = await TransferRepository.get_by_id(session, inserted_id)
+        return created, True
+
+    @staticmethod
+    async def calculate_24h_spent(
+        session: AsyncSession,
+        client_id: str,
+        limit_currency: str,
+        rate_service: RateService,
+        exclude_transfer_id: str | None = None,
+    ) -> Decimal:
+        """Rolling 24-hour volume for a client, expressed in limit currency."""
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        stmt = select(Transfers.source_amount, Transfers.source_currency).where(
+            Transfers.client_id == client_id,
+            Transfers.status.in_(COUNTED_DAILY_LIMIT_STATES),
+            Transfers.created_at >= cutoff,
+        )
+        if exclude_transfer_id is not None:
+            stmt = stmt.where(Transfers.transfer_id != exclude_transfer_id)
+
+        rows = (await session.execute(stmt)).all()
+        total = Decimal("0")
+        for amount, currency in rows:
+            if amount is None or currency is None:
+                continue
+            value = Decimal(str(amount))
+            if currency == limit_currency:
+                total += value
+                continue
+            try:
+                total += rate_service.convert(value, currency, limit_currency)
+            except RateNotAvailable as exc:
+                raise RateUnavailableError(
+                    currency, limit_currency, exc.details
+                ) from exc
+        return total
+
+    @staticmethod
+    async def claim_pending(
+        session: AsyncSession,
+        limit: int,
+        claim_timeout: timedelta,
+    ) -> list[Transfers]:
+        """Claim queued transfers with a lease so a crashed worker can retry."""
+        now = datetime.now(timezone.utc)
+        stmt = (
+            select(Transfers)
+            .where(
+                Transfers.status == TransferState.PENDING,
+                or_(
+                    Transfers.claimed_at.is_(None),
+                    Transfers.claimed_at < now - claim_timeout,
+                ),
+            )
+            .order_by(Transfers.created_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+        for row in rows:
+            row.claimed_at = now
         await session.commit()
-        await session.refresh(transfer)
-        return transfer
+        return rows
+
+    @staticmethod
+    async def get_reconcilable(
+        session: AsyncSession,
+        limit: int,
+        min_age: timedelta,
+    ) -> list[Transfers]:
+        now = datetime.now(timezone.utc)
+        stmt = (
+            select(Transfers)
+            .where(
+                Transfers.status.in_(
+                    (TransferState.PROCESSING, TransferState.NEEDS_REVIEW)
+                ),
+                Transfers.provider_id.is_not(None),
+                or_(
+                    Transfers.last_reconciled_at.is_(None),
+                    Transfers.last_reconciled_at < now - min_age,
+                ),
+            )
+            .order_by(Transfers.updated_at.asc().nullsfirst())
+            .limit(limit)
+        )
+        return list((await session.execute(stmt)).scalars().all())
 
     @staticmethod
     async def record_attempt_and_status(
@@ -246,7 +384,11 @@ class TransferRepository:
         new_status: TransferState,
         attempt: dict | None = None,
     ) -> Transfers | None:
-        stmt = select(Transfers).where(Transfers.transfer_id == transfer_id).with_for_update()
+        stmt = (
+            select(Transfers)
+            .where(Transfers.transfer_id == transfer_id)
+            .with_for_update()
+        )
         result = await session.execute(stmt)
         transfer = result.scalar_one_or_none()
         if not transfer:
@@ -263,6 +405,7 @@ class TransferRepository:
         )
         transfer.status = new_status
         transfer.transitions = transitions
+        transfer.claimed_at = None
 
         # Record provider attempt
         if attempt:

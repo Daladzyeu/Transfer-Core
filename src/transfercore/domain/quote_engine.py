@@ -194,8 +194,8 @@ class InsufficientFundsError(QuoteError):
 
 
 class DailyLimitExceededError(QuoteError):
-    def __init__(self, message="Daily limit exceeded"):
-        super().__init__("DAILY_LIMIT_EXCEEDED", message)
+    def __init__(self, message="Daily limit exceeded", details: dict | None = None):
+        super().__init__("DAILY_LIMIT_EXCEEDED", message, details)
 
 
 @dataclass(frozen=True)

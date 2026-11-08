@@ -14,6 +14,7 @@ from transfercore.infrastructure.tables import (
     Quotes,
     Transfers,
     TransferState,
+    WebhookEvent,
 )
 
 # this is the Alembic Config object, which provides

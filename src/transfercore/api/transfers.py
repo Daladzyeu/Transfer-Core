@@ -1,6 +1,9 @@
+import hashlib
+import json
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-import uuid
+
 from fastapi import APIRouter, Depends, Header, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -9,13 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from transfercore.domain.money import Money, registry
 from transfercore.domain.quote_engine import (
     DailyLimitExceededError,
-    QuoteExpiredError,
-    QuoteNotFoundError,
+    QuoteError,
+    RateUnavailableError,
     ValidationError,
 )
-from transfercore.domain.provider_router import ProviderRouter
+from transfercore.domain.rates import RateNotAvailable
 from transfercore.infrastructure.db import get_db
-from transfercore.infrastructure.provider_client import MockProviderClient
 from transfercore.infrastructure.repositories import (
     BalanceRepository,
     QuoteRepository,
@@ -26,203 +28,237 @@ from transfercore.infrastructure.tables import Transfers, TransferState
 router = APIRouter(prefix="/transfers", tags=["transfers"])
 
 
+class ClientNotFoundError(QuoteError):
+    def __init__(self, client_id: str):
+        super().__init__(
+            "CLIENT_NOT_FOUND",
+            f"Client {client_id} not found",
+            {"client_id": client_id},
+        )
+
+
+class IdempotencyConflictError(QuoteError):
+    def __init__(self, idempotency_key: str):
+        super().__init__(
+            "IDEMPOTENCY_KEY_REUSED",
+            "The Idempotency-Key was already used with a different request",
+            {"idempotency_key": idempotency_key},
+        )
+
+
 class RecipientSchema(BaseModel):
-    name: str = Field(..., example="Somchai Jaidee")
-    account: str = Field(..., example="1234567890")
-    bank_code: str = Field(..., example="BKKB")
+    name: str = Field(..., min_length=1, example="Somchai Jaidee")
+    account: str = Field(..., min_length=1, example="1234567890")
+    bank_code: str = Field(..., min_length=1, example="BKKB")
 
 
 class TransferCreateRequest(BaseModel):
-    quote_id: str
-    client_id: str
+    quote_id: str = Field(..., min_length=1)
+    client_id: str = Field(..., min_length=1)
     recipient: RecipientSchema
+
+
+def _iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _money_json(
+    amount: Decimal | None, currency: str | None, reg
+) -> dict | None:
+    if amount is None or currency is None:
+        return None
+    value = Money.from_decimal(Decimal(str(amount)), currency, reg)
+    return {"amount": value.to_str(reg), "currency": currency}
 
 
 def transfer_to_response(transfer: Transfers, reg=registry) -> dict:
     source_curr = transfer.source_currency or "RUB"
     target_curr = transfer.target_currency or "THB"
-    source_amt_str = (
-        Money.from_decimal(Decimal(str(transfer.source_amount)), source_curr, reg).to_str()
-        if transfer.source_amount is not None
-        else "0.00"
-    )
-    target_amt_str = (
-        Money.from_decimal(Decimal(str(transfer.target_amount)), target_curr, reg).to_str()
-        if transfer.target_amount is not None
-        else "0.00"
-    )
-
-    created_iso = (
-        transfer.created_at.isoformat()
-        if hasattr(transfer, "created_at") and transfer.created_at
-        else datetime.now(timezone.utc).isoformat()
-    )
 
     return {
         "transfer_id": transfer.transfer_id,
         "quote_id": transfer.quote_id,
         "client_id": transfer.client_id,
         "status": transfer.status.value,
-        "source_amount": {
-            "amount": source_amt_str,
-            "currency": source_curr,
-        },
-        "target_amount": {
-            "amount": target_amt_str,
-            "currency": target_curr,
-        },
+        "direction_id": transfer.direction_id,
+        "source_amount": _money_json(
+            transfer.source_amount, source_curr, reg
+        ),
+        "fee": _money_json(transfer.fee_amount, transfer.fee_currency, reg),
+        "target_amount": _money_json(
+            transfer.target_amount, target_curr, reg
+        ),
         "recipient": transfer.recipient,
+        "provider_id": transfer.provider_id,
+        "provider_payout_id": transfer.provider_payout_id,
+        "failure_code": transfer.failure_code,
+        "review_reason": transfer.review_reason,
         "attempts": transfer.attempts or [],
         "transitions": transfer.transitions or [],
-        "created_at": created_iso,
+        "created_at": _iso(transfer.created_at),
+        "updated_at": _iso(transfer.updated_at),
     }
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+def _fingerprint(body: TransferCreateRequest) -> str:
+    canonical = json.dumps(
+        {
+            "quote_id": body.quote_id,
+            "client_id": body.client_id,
+            "recipient": body.recipient.model_dump(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@router.post("", status_code=status.HTTP_202_ACCEPTED)
 async def create_transfer(
     body: TransferCreateRequest,
     request: Request,
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
     session: AsyncSession = Depends(get_db),
 ):
+    idempotency_key = (idempotency_key or "").strip()
     if not idempotency_key:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "error": {
-                    "code": "VALIDATION_ERROR",
-                    "message": "Idempotency-Key header is required",
-                }
-            },
+        raise ValidationError(
+            "Idempotency-Key header is required",
+            {"header": "Idempotency-Key"},
         )
 
-    # 1. Idempotency Check
-    existing = await TransferRepository.get_by_idempotency_key(session, idempotency_key)
-    if existing:
-        return transfer_to_response(existing)
+    reg = getattr(request.app.state, "currency_registry", registry)
+    fingerprint = _fingerprint(body)
 
-    # 2. Retrieve Quote
-    quote = await QuoteRepository.get_by_id(session, body.quote_id)
+    existing = await TransferRepository.get_by_idempotency_key(
+        session, idempotency_key
+    )
+    if existing is not None:
+        if (
+            existing.request_fingerprint is not None
+            and existing.request_fingerprint != fingerprint
+        ):
+            raise IdempotencyConflictError(idempotency_key)
+        await session.commit()
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=transfer_to_response(existing, reg),
+            headers={"Idempotency-Replayed": "true"},
+        )
 
-    # 3. Check Daily Limit
     clients_map = getattr(request.app.state, "clients", {})
     client_info = clients_map.get(body.client_id)
-    if client_info and "daily_limit" in client_info:
-        limit_cfg = client_info["daily_limit"]
-        limit_amount = Decimal(str(limit_cfg.get("amount", "999999999")))
-        spent_today = await TransferRepository.calculate_24h_spent(session, body.client_id)
-        if spent_today + quote.source_amount.amount > limit_amount:
-            raise DailyLimitExceededError("Daily limit exceeded for client")
+    if client_info is None:
+        raise ClientNotFoundError(body.client_id)
 
-    # 4. Hold Funds in atomic transaction
-    source_curr = quote.source_amount.currency
-    source_amt = quote.source_amount.amount
-    await BalanceRepository.hold_funds(session, body.client_id, source_curr, source_amt)
-
-    # 5. Create Transfer Entity
-    transfer_id = f"tr_{uuid.uuid4().hex[:12]}"
-    recipient_dict = body.recipient.model_dump()
+    quote = await QuoteRepository.get_by_id(session, body.quote_id)
+    now = datetime.now(timezone.utc)
     transfer = Transfers(
-        transfer_id=transfer_id,
+        transfer_id=f"tr_{uuid.uuid4().hex[:12]}",
         quote_id=body.quote_id,
         client_id=body.client_id,
         idempotency_key=idempotency_key,
-        status=TransferState.PROCESSING,
-        source_amount=source_amt,
-        source_currency=source_curr,
+        request_fingerprint=fingerprint,
+        status=TransferState.PENDING,
+        direction_id=quote.direction_id,
+        source_amount=quote.source_amount.amount,
+        source_currency=quote.source_amount.currency,
+        fee_amount=quote.fee.amount,
+        fee_currency=quote.fee.currency,
         target_amount=quote.target_amount.amount,
         target_currency=quote.target_amount.currency,
-        recipient=recipient_dict,
+        recipient=body.recipient.model_dump(),
         attempts=[],
         transitions=[
             {
-                "from": "CREATED",
-                "to": "PROCESSING",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "from": None,
+                "to": TransferState.PENDING.value,
+                "timestamp": now.isoformat(),
+                "source": "client",
             }
         ],
     )
-    transfer = await TransferRepository.create_transfer(session, transfer)
 
-    # 6. Provider Selection & Dispatch
-    providers_list = getattr(request.app.state, "providers", [])
-    rates_map = getattr(request.app.state, "rates_map", {})
-    router_engine = ProviderRouter(providers_list, rates_map)
-
-    # Find tariff min_margin_percent
-    tariff_margin = Decimal("0.50")
-    engine = getattr(request.app.state, "quote_engine", None)
-    if engine and hasattr(engine, "_tariffs_by_route"):
-        route_tariffs = list(engine._tariffs_by_route.values())
-        matching = [t for t in route_tariffs if t.direction_id == quote.direction_id]
-        if matching:
-            tariff_margin = matching[0].min_margin_percent
-
-    ranked_providers = router_engine.select_providers(
-        direction_id=quote.direction_id,
-        target_amount=quote.target_amount.amount,
-        target_currency=quote.target_amount.currency,
-        source_amount=source_amt,
-        source_currency=source_curr,
-        client_fee=quote.fee.amount,
-        min_margin_percent=tariff_margin,
+    created, inserted = await TransferRepository.create_pending_transfer(
+        session, transfer
     )
-
-    reg = getattr(request.app.state, "currency_registry", registry)
-    provider_client = MockProviderClient()
-    final_status = TransferState.PROCESSING
-    last_attempt = None
-
-    for prov_id in ranked_providers:
-        attempt_key = f"{transfer_id}-{prov_id}"
-        target_amt_str = quote.target_amount.to_str(reg)
-
-        payout_resp = await provider_client.create_payout(
-            provider_id=prov_id,
-            idempotency_key=attempt_key,
-            reference=transfer_id,
-            amount=target_amt_str,
-            currency=quote.target_amount.currency,
-            recipient=recipient_dict,
+    if not inserted:
+        if (
+            created is not None
+            and created.request_fingerprint is not None
+            and created.request_fingerprint != fingerprint
+        ):
+            await session.rollback()
+            raise IdempotencyConflictError(idempotency_key)
+        await session.commit()
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=transfer_to_response(created, reg),
+            headers={"Idempotency-Replayed": "true"},
         )
 
-        last_attempt = {
-            "provider_id": prov_id,
-            "payout_id": payout_resp.payout_id,
-            "status": payout_resp.status,
-            "error_code": payout_resp.error_code,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+    try:
+        await BalanceRepository.hold_funds(
+            session,
+            body.client_id,
+            quote.source_amount.currency,
+            quote.source_amount.amount,
+        )
 
-        if payout_resp.is_success:
-            # Payout accepted (201)
-            if payout_resp.status == "COMPLETED":
-                final_status = TransferState.COMPLETED
-                await BalanceRepository.debit_held_funds(session, body.client_id, source_curr, source_amt)
+        if "daily_limit" in client_info:
+            limit_cfg = client_info["daily_limit"]
+            limit_currency = limit_cfg.get(
+                "currency", quote.source_amount.currency
+            )
+            limit_amount = Decimal(str(limit_cfg.get("amount", "0")))
+            rate_service = getattr(request.app.state, "rate_service", None)
+            if rate_service is None:
+                spent = Decimal("0")
+                current_in_limit = quote.source_amount.amount
             else:
-                final_status = TransferState.PROCESSING
-            break
-        elif payout_resp.status == "TIMEOUT":
-            # Timeout (slow scenario) - must NOT try next provider to avoid double payout!
-            final_status = TransferState.PROCESSING
-            break
-        else:
-            # Declined (422) or Error (5xx) - record failure, try next eligible fallback provider
-            pass
+                spent = await TransferRepository.calculate_24h_spent(
+                    session,
+                    body.client_id,
+                    limit_currency,
+                    rate_service,
+                    exclude_transfer_id=created.transfer_id,
+                )
+                try:
+                    current_in_limit = rate_service.convert(
+                        quote.source_amount.amount,
+                        quote.source_amount.currency,
+                        limit_currency,
+                    )
+                except RateNotAvailable as exc:
+                    raise RateUnavailableError(
+                        quote.source_amount.currency,
+                        limit_currency,
+                        exc.details,
+                    ) from exc
+            if spent + current_in_limit > limit_amount:
+                raise DailyLimitExceededError(
+                    f"Daily limit exceeded for client {body.client_id}",
+                    {
+                        "limit": str(limit_amount),
+                        "currency": limit_currency,
+                        "spent": str(spent),
+                        "requested": str(current_in_limit),
+                    },
+                )
 
-    # If all eligible providers failed and none accepted
-    if last_attempt and last_attempt.get("status") in ("DECLINED", "ERROR") and final_status == TransferState.PROCESSING and len(ranked_providers) > 0:
-        # Check if the last attempted provider was a failure
-        if last_attempt["status"] != "PROCESSING":
-            final_status = TransferState.FAILED
-            await BalanceRepository.release_hold(session, body.client_id, source_curr, source_amt)
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
 
-    # Save final status and attempt
-    transfer = await TransferRepository.record_attempt_and_status(
-        session, transfer_id, final_status, last_attempt
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content=transfer_to_response(created, reg),
     )
-
-    return transfer_to_response(transfer, reg)
 
 
 @router.get("/{transfer_id}", status_code=status.HTTP_200_OK)

@@ -54,6 +54,25 @@ class TomlConfigSettingsSource(PydanticBaseSettingsSource):
             return data
 
 
+class EnvDatabaseUrlSource(PydanticBaseSettingsSource):
+    """Read the documented DATABASE_URL variable with high priority.
+
+    ``settings.toml`` is a convenience default, not an override: deployment
+    platforms and the test entrypoint set DATABASE_URL, and that value must
+    win. Without this source pydantic-settings would let the TOML file shadow
+    the environment variable.
+    """
+
+    def get_field_value(self, field: Any, field_name: str) -> Tuple[Any, str, bool]:
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        url = os.environ.get("DATABASE_URL")
+        if not url:
+            return {}
+        return {"database": {"url": normalize_database_url(url)}}
+
+
 class Settings(BaseSettings):
     database: DatabaseConfig = DatabaseConfig(
         url=normalize_database_url(
@@ -76,9 +95,11 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Environment variables take precedence over TOML file
+        # Precedence: explicit constructor arguments, then the documented
+        # DATABASE_URL variable, then nested env vars, then settings.toml.
         return (
-            env_settings,
             init_settings,
+            EnvDatabaseUrlSource(settings_cls),
+            env_settings,
             TomlConfigSettingsSource(settings_cls),
         )

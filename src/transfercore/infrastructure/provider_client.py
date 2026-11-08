@@ -14,6 +14,16 @@ class PayoutResponse:
     http_status: int = 0
 
 
+@dataclass
+class PayoutStatus:
+    found: bool
+    status: str | None = None
+    payout_id: str | None = None
+    failure_code: str | None = None
+    http_status: int = 0
+    is_not_found: bool = False
+
+
 def get_mock_provider_url() -> str:
     url = os.environ.get("MOCK_PROVIDER_URL", "http://mock-provider:9000")
     if "mock-provider" in url:
@@ -37,8 +47,10 @@ class MockProviderClient:
         currency: str,
         recipient: dict,
         callback_url: str | None = None,
-        timeout_sec: float = 35.0,
+        timeout_sec: float | None = None,
     ) -> PayoutResponse:
+        if timeout_sec is None:
+            timeout_sec = float(os.environ.get("PROVIDER_TIMEOUT_SEC", "35"))
         url = f"{self.base_url}/{provider_id}/payouts"
         headers = {
             "Content-Type": "application/json",
@@ -99,5 +111,61 @@ class MockProviderClient:
                 status="ERROR",
                 error_code="TRANSPORT_ERROR",
                 error_message=str(exc),
+                http_status=0,
+            )
+
+    async def get_payout(
+        self,
+        provider_id: str,
+        payout_id: str,
+        timeout_sec: float = 10.0,
+    ) -> PayoutStatus:
+        url = f"{self.base_url}/{provider_id}/payouts/{payout_id}"
+        return await self._get_status(url, timeout_sec)
+
+    async def find_payout(
+        self,
+        provider_id: str,
+        reference: str,
+        timeout_sec: float = 10.0,
+    ) -> PayoutStatus:
+        url = f"{self.base_url}/{provider_id}/payouts"
+        return await self._get_status(
+            url, timeout_sec, params={"reference": reference}
+        )
+
+    async def _get_status(
+        self,
+        url: str,
+        timeout_sec: float,
+        params: dict | None = None,
+    ) -> PayoutStatus:
+        try:
+            async with httpx.AsyncClient(timeout=timeout_sec) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code == 404:
+                    return PayoutStatus(
+                        found=False,
+                        is_not_found=True,
+                        http_status=resp.status_code,
+                    )
+                if resp.status_code != 200:
+                    return PayoutStatus(
+                        found=False,
+                        status="ERROR",
+                        http_status=resp.status_code,
+                    )
+                data = resp.json()
+                return PayoutStatus(
+                    found=True,
+                    status=data.get("status"),
+                    payout_id=data.get("payout_id"),
+                    failure_code=data.get("failure_code"),
+                    http_status=resp.status_code,
+                )
+        except Exception:
+            return PayoutStatus(
+                found=False,
+                status="ERROR",
                 http_status=0,
             )

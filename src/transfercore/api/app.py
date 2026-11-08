@@ -14,12 +14,16 @@ from transfercore.domain.rates import RateService
 from transfercore.api.quotes import router as quotes_router
 from transfercore.api.clients import router as clients_router
 from transfercore.api.transfers import router as transfers_router
+from transfercore.api.webhooks import router as webhooks_router
 from transfercore.infrastructure.db import AsyncSessionLocal
 from transfercore.infrastructure.rate_feed import load_rate_feed
 from transfercore.infrastructure.repositories import BalanceRepository
+from transfercore.infrastructure.transfer_worker import TransferWorker
 
 
-def create_app(data_dir: Path | str | None = None) -> FastAPI:
+def create_app(
+    data_dir: Path | str | None = None, *, start_worker: bool = True
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         path = Path(data_dir) if data_dir is not None else Path(
@@ -61,12 +65,25 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         else:
             app.state.clients = {}
 
-        yield
+        worker = None
+        if start_worker and os.environ.get(
+            "TRANSFER_WORKER_ENABLED", "1"
+        ).strip() not in ("0", "false", "False"):
+            worker = TransferWorker(app.state)
+            app.state.transfer_worker = worker
+            await worker.start()
+
+        try:
+            yield
+        finally:
+            if worker is not None:
+                await worker.stop()
 
     app = FastAPI(title="Transfer Core", lifespan=lifespan)
     app.include_router(quotes_router)
     app.include_router(clients_router)
     app.include_router(transfers_router)
+    app.include_router(webhooks_router)
 
     @app.get("/health", tags=["health"])
     async def health():
@@ -75,10 +92,19 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     @app.exception_handler(QuoteError)
     async def handle_quote_error(request: Request, exc: QuoteError):
         status_code = 400
-        if exc.code in ("QUOTE_NOT_FOUND", "UNSUPPORTED_DIRECTION", "CLIENT_NOT_FOUND"):
+        if exc.code in (
+            "QUOTE_NOT_FOUND",
+            "UNSUPPORTED_DIRECTION",
+            "CLIENT_NOT_FOUND",
+            "TRANSFER_NOT_FOUND",
+        ):
             status_code = 404
         elif exc.code == "QUOTE_EXPIRED":
             status_code = 410
+        elif exc.code == "IDEMPOTENCY_KEY_REUSED":
+            status_code = 409
+        elif exc.code == "INVALID_SIGNATURE":
+            status_code = 401
         elif exc.code in (
             "AMOUNT_BELOW_MIN",
             "AMOUNT_ABOVE_MAX",
