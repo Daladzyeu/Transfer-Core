@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from transfercore.api.schemas import QuoteCreateRequest, QuoteResponse, MoneyModel
+from transfercore.domain.money import CurrencyRegistry, registry
 from transfercore.domain.quote_engine import QuoteRequest, QuoteResult
 from transfercore.infrastructure.db import get_db
 from transfercore.infrastructure.repositories import QuoteRepository
@@ -9,21 +10,24 @@ from transfercore.infrastructure.repositories import QuoteRepository
 router = APIRouter(prefix="/quotes", tags=["quotes"])
 
 
-def quote_to_response(q: QuoteResult) -> QuoteResponse:
+def quote_to_response(
+    q: QuoteResult, reg: CurrencyRegistry = registry
+) -> QuoteResponse:
 
     return QuoteResponse(
         quote_id=q.quote_id,
         direction_id=q.direction_id,
         source_amount=MoneyModel(
-            amount=q.source_amount.to_str(), currency=q.source_amount.currency
+            amount=q.source_amount.to_str(reg), currency=q.source_amount.currency
         ),
-        fee=MoneyModel(amount=q.fee.to_str(), currency=q.fee.currency),
+        fee=MoneyModel(amount=q.fee.to_str(reg), currency=q.fee.currency),
         amount_to_convert=MoneyModel(
-            amount=q.amount_to_convert.to_str(), currency=q.amount_to_convert.currency
+            amount=q.amount_to_convert.to_str(reg),
+            currency=q.amount_to_convert.currency,
         ),
         rate=str(q.rate),
         target_amount=MoneyModel(
-            amount=q.target_amount.to_str(), currency=q.target_amount.currency
+            amount=q.target_amount.to_str(reg), currency=q.target_amount.currency
         ),
         breakdown=q.breakdown,
         expires_at=q.expires_at,
@@ -46,15 +50,17 @@ async def create_quote(
         amount_type=body.amount_type,
     )
 
+    reg = getattr(request.app.state, "currency_registry", registry)
     quote = engine.calculate(domain_request)
-    await QuoteRepository.save(session=session, quote=quote)
+    await QuoteRepository.save(session=session, quote=quote, registry=reg)
 
-    return quote_to_response(quote)
+    return quote_to_response(quote, reg)
 
 
 @router.get("/{quote_id}", status_code=status.HTTP_200_OK)
 async def get_quote(
     quote_id: str, request: Request, session: AsyncSession = Depends(get_db)
 ):
+    reg = getattr(request.app.state, "currency_registry", registry)
     quote = await QuoteRepository.get_by_id(session=session, quote_id=quote_id)
-    return quote_to_response(quote)
+    return quote_to_response(quote, reg)

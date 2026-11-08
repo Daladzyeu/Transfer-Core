@@ -90,7 +90,7 @@ class Money:
         return cls(amount=quantized, currency=currency)
 
     def to_str(self, reg: CurrencyRegistry = registry) -> str:
-        minor_units = registry.get_minor_units(self.currency)
+        minor_units = reg.get_minor_units(self.currency)
         exponent = Decimal(10) ** -minor_units
         quantized = self.amount.quantize(exponent, rounding=ROUND_HALF_UP)
         if minor_units == 0:

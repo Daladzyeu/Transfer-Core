@@ -1,14 +1,16 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
 class QuoteCreateRequest(BaseModel):
-    source_country: str
-    source_currency: str
-    target_country: str
-    target_currency: str
+    source_country: str = Field(..., pattern=r"^[A-Z]{2}$")
+    source_currency: str = Field(..., pattern=r"^[A-Z]{3}$")
+    target_country: str = Field(..., pattern=r"^[A-Z]{2}$")
+    target_currency: str = Field(..., pattern=r"^[A-Z]{3}$")
     payout_method: str
-    amount: str
-    amount_type: str
+    amount: str = Field(..., strict=True)
+    amount_type: Literal["SOURCE", "TARGET"]
 
 
 class MoneyModel(BaseModel):

@@ -168,13 +168,14 @@ async def create_transfer(
         min_margin_percent=tariff_margin,
     )
 
+    reg = getattr(request.app.state, "currency_registry", registry)
     provider_client = MockProviderClient()
     final_status = TransferState.PROCESSING
     last_attempt = None
 
     for prov_id in ranked_providers:
         attempt_key = f"{transfer_id}-{prov_id}"
-        target_amt_str = quote.target_amount.to_str()
+        target_amt_str = quote.target_amount.to_str(reg)
 
         payout_resp = await provider_client.create_payout(
             provider_id=prov_id,
@@ -221,7 +222,6 @@ async def create_transfer(
         session, transfer_id, final_status, last_attempt
     )
 
-    reg = getattr(request.app.state, "currency_registry", registry)
     return transfer_to_response(transfer, reg)
 
 

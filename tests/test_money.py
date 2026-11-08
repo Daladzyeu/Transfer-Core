@@ -120,6 +120,12 @@ def test_to_str_exact_formatting(mock_registry, amount, currency, expected_str):
     assert m.to_str(reg=mock_registry) == expected_str
 
 
+def test_to_str_uses_passed_registry_not_global():
+    reg = CurrencyRegistry({"RUB": 4})
+    m = Money(amount=Decimal("1.23456"), currency="RUB")
+    assert m.to_str(reg) == "1.2346"
+
+
 # --- Tests for from_str String Parsing ---
 
 

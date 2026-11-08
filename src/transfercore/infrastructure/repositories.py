@@ -1,7 +1,5 @@
-import dataclasses
 from decimal import Decimal
 
-from fastapi.encoders import jsonable_encoder
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,7 +10,7 @@ from transfercore.domain.quote_engine import (
     QuoteExpiredError,
 )
 from transfercore.infrastructure.tables import ClientBalance, Quotes, Transfers, TransferState
-from transfercore.domain.money import Money
+from transfercore.domain.money import CurrencyRegistry, Money, registry
 from datetime import datetime, timedelta, timezone
 
 
@@ -53,21 +51,36 @@ class QuoteRepository:
             target_amount=parse_money(payload["target_amount"]),
             breakdown=payload.get("breakdown"),
             expires_at=expires_str,
+            rate_updated_at=payload.get("rate_updated_at"),
         )
 
     @staticmethod
-    async def save(session: AsyncSession, quote: QuoteResult) -> QuoteResult:
+    async def save(
+        session: AsyncSession,
+        quote: QuoteResult,
+        registry: CurrencyRegistry = registry,
+    ) -> QuoteResult:
         expires_str = quote.expires_at.replace("Z", "+00:00")
         expires_at_dt = datetime.fromisoformat(expires_str)
         if expires_at_dt.tzinfo is None:
             expires_at_dt = expires_at_dt.replace(tzinfo=timezone.utc)
 
-        quote_dict = dataclasses.asdict(quote)
+        def money_payload(money: Money) -> dict:
+            return {
+                "amount": money.to_str(registry),
+                "currency": money.currency,
+            }
 
-        quote_dict.pop("quote_id", None)
-        quote_dict.pop("expires_at", None)
-
-        payload_data = jsonable_encoder(quote_dict)
+        payload_data = {
+            "direction_id": quote.direction_id,
+            "source_amount": money_payload(quote.source_amount),
+            "fee": money_payload(quote.fee),
+            "amount_to_convert": money_payload(quote.amount_to_convert),
+            "rate": str(quote.rate),
+            "target_amount": money_payload(quote.target_amount),
+            "breakdown": quote.breakdown,
+            "rate_updated_at": quote.rate_updated_at,
+        }
 
         db_quote = Quotes(
             quote_id=quote.quote_id, payload=payload_data, expires_at=expires_at_dt

@@ -10,12 +10,13 @@ from fastapi.encoders import jsonable_encoder
 
 from transfercore.domain.quote_engine import QuoteEngine, QuoteError
 from transfercore.domain.money import CurrencyRegistry, registry
+from transfercore.domain.rates import RateService
 from transfercore.api.quotes import router as quotes_router
 from transfercore.api.clients import router as clients_router
 from transfercore.api.transfers import router as transfers_router
 from transfercore.infrastructure.db import AsyncSessionLocal
+from transfercore.infrastructure.rate_feed import load_rate_feed
 from transfercore.infrastructure.repositories import BalanceRepository
-from decimal import Decimal
 
 
 def create_app(data_dir: Path | str | None = None) -> FastAPI:
@@ -28,7 +29,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             raise RuntimeError(f"DATA_DIR does not exist: {path}")
 
         tariffs = json.loads((path / "tariffs.json").read_text(encoding="utf-8"))
-        rates = json.loads((path / "rates.json").read_text(encoding="utf-8"))
+        rates = await load_rate_feed(path / "rates.json")
 
         currencies_file = path / "currencies.json"
         if currencies_file.exists():
@@ -36,13 +37,14 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
         else:
             app.state.currency_registry = registry
 
+        app.state.rate_service = RateService(rates)
         app.state.quote_engine = QuoteEngine(
-            tariffs=tariffs, rates=rates, registry=app.state.currency_registry
+            tariffs=tariffs,
+            registry=app.state.currency_registry,
+            rate_service=app.state.rate_service,
         )
 
-        app.state.rates_map = {
-            (r["base"], r["quote"]): Decimal(r["rate"]) for r in rates
-        }
+        app.state.rates_map = app.state.rate_service.rate_map()
 
         providers_file = path / "providers.json"
         if providers_file.exists():
@@ -107,7 +109,7 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
                 "error": {
                     "code": "VALIDATION_ERROR",
                     "message": "Invalid request format",
-                    "details": {"errors": exc.errors()},
+                    "details": {"errors": jsonable_encoder(exc.errors())},
                 }
             },
         )

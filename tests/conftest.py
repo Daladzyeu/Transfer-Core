@@ -9,6 +9,10 @@ from sqlalchemy import text
 from transfercore.infrastructure.db import AsyncSessionLocal, engine
 from transfercore.infrastructure.repositories import BalanceRepository
 
+# Keep tests deterministic: use the bundled rates snapshot instead of the
+# running mock provider. The live-feed path has its own unit test.
+os.environ["RATES_URL"] = "snapshot"
+
 
 async def _reset_database() -> None:
     async with engine.begin() as connection:
